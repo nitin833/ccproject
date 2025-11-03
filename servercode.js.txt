@@ -1,0 +1,520 @@
+const express = require("express");
+const promMid = require("express-prometheus-middleware");
+const si = require("systeminformation");
+const mongoose = require("mongoose");
+const bodyParser = require("body-parser");
+const crypto = require("crypto");
+const fs = require("fs").promises;
+const path = require("path");
+
+const app = express();
+const port = 3000;
+
+// MongoDB Atlas credentials
+const MONGO_URI = "mongodb+srv://nitin_user123:VXrC7Jb1ZEIZObIe@cluster0.xztjx9p.mongodb.net/cc_project";
+
+// Query result limit
+const MAX_QUERY_RESULTS = 5;
+
+// Middlewares
+app.use(bodyParser.json());
+
+// Prometheus middleware for metrics collection
+app.use(
+  promMid({
+    metricsPath: "/metrics",
+    collectDefaultMetrics: true,
+    requestDurationBuckets: [0.1, 0.5, 1, 3, 5, 10],
+  })
+);
+
+// MongoDB Connection
+mongoose
+  .connect(MONGO_URI)
+  .then(() => console.log("✓ MongoDB connected"))
+  .catch((err) => console.error("✗ MongoDB error:", err.message));
+
+// User Schema
+const userSchema = new mongoose.Schema(
+  { username: String, password: String },
+  { collection: "users" }
+);
+const User = mongoose.model("User", userSchema);
+
+// ============================================
+// SIMPLE CACHE (Max 5 Users)
+// ============================================
+
+class SimpleCache {
+  constructor(maxSize = 5) {
+    this.cache = new Map();
+    this.maxSize = maxSize;
+  }
+
+  get(key) {
+    if (!this.cache.has(key)) return null;
+    // Move to end (most recently used)
+    const value = this.cache.get(key);
+    this.cache.delete(key);
+    this.cache.set(key, value);
+    return value;
+  }
+
+  set(key, value) {
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    } else if (this.cache.size >= this.maxSize) {
+      // Remove least recently used (first item)
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+    }
+    this.cache.set(key, value);
+  }
+
+  has(key) {
+    return this.cache.has(key);
+  }
+
+  clear() {
+    this.cache.clear();
+  }
+
+  getStats() {
+    return {
+      size: this.cache.size,
+      maxSize: this.maxSize,
+      keys: Array.from(this.cache.keys())
+    };
+  }
+}
+
+const userCache = new SimpleCache(5);
+
+// ============================================
+// AUTH MIDDLEWARE
+// ============================================
+async function authMiddleware(req, res, next) {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(401).json({ error: "Username and password required" });
+  }
+
+  // Check cache first
+  const cachedUser = userCache.get(`user:${username}`);
+  if (cachedUser && cachedUser.password === password) {
+    req.user = cachedUser;
+    return next();
+  }
+
+  // Check database
+  try {
+    const user = await User.findOne({ username, password }).limit(1);
+
+    if (!user) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    // Store in cache
+    userCache.set(`user:${username}`, user);
+
+    req.user = user;
+    next();
+  } catch (error) {
+    return res.status(500).json({ error: "Authentication error" });
+  }
+}
+
+// ============================================
+// BASIC ROUTES (No Auth Required)
+// ============================================
+app.get("/", (req, res) => {
+  res.send("🚀 Node.js Server with Realistic Load Patterns");
+});
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// ============================================
+// LIGHTWEIGHT ROUTES (< 50ms) - No Auth
+// ============================================
+app.get("/api/status", (req, res) => {
+  res.json({
+    status: "operational",
+    uptime: process.uptime(),
+    version: "1.0.0"
+  });
+});
+
+app.get("/api/timestamp", (req, res) => {
+  res.json({
+    unix: Date.now(),
+    iso: new Date().toISOString(),
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+  });
+});
+
+// No Auth on current-metrics
+app.get("/current-metrics", async (req, res) => {
+  try {
+    const cpuData = await si.currentLoad();
+    const memData = await si.mem();
+    const uptime = await si.time();
+    const netPing = await si.inetLatency("8.8.8.8");
+
+    const activeLoad = cpuData.currentLoad / 100;
+    const memoryLoad = (memData.active / memData.total);
+
+    const baseResponseTime = 10;
+    const responseTime = baseResponseTime * (1 + activeLoad * 2 + memoryLoad);
+
+    const metrics = {
+      cpu_usage_percent: cpuData.currentLoad.toFixed(2),
+      memory_usage_percent: ((memData.active / memData.total) * 100).toFixed(2),
+      memory_used_mb: (memData.active / (1024 * 1024)).toFixed(2),
+      memory_total_mb: (memData.total / (1024 * 1024)).toFixed(2),
+      uptime_seconds: uptime.uptime,
+      network_latency_ms: netPing,
+      response_time_ms: responseTime.toFixed(2),
+      timestamp: new Date().toISOString(),
+
+      normalized: {
+        cpu: (cpuData.currentLoad / 100).toFixed(4),
+        memory: memoryLoad.toFixed(4),
+        latency: (netPing / 1000).toFixed(4),
+        response_time: Math.min(responseTime / 1000, 1).toFixed(4)
+      }
+    };
+
+    res.json(metrics);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch metrics", details: error.message });
+  }
+});
+
+// ============================================
+// CPU INTENSIVE ROUTES (200-500ms) - No Auth
+// ============================================
+app.get("/api/compute/prime/:n", (req, res) => {
+  const n = parseInt(req.params.n) || 10000;
+  const limit = Math.min(n, 100000); // Safety limit
+
+  const startTime = Date.now();
+
+  function isPrime(num) {
+    if (num < 2) return false;
+    for (let i = 2; i <= Math.sqrt(num); i++) {
+      if (num % i === 0) return false;
+    }
+    return true;
+  }
+
+  const primes = [];
+  for (let i = 2; primes.length < limit && i < limit * 20; i++) {
+    if (isPrime(i)) primes.push(i);
+  }
+
+  res.json({
+    count: primes.length,
+    largest: primes[primes.length - 1],
+    computation_time_ms: Date.now() - startTime,
+    cached: false
+  });
+});
+
+app.post("/api/compute/hash", (req, res) => {
+  const { data = "default", iterations = 1000 } = req.body;
+  const limit = Math.min(iterations, 10000);
+
+  const startTime = Date.now();
+  let hash = data;
+
+  for (let i = 0; i < limit; i++) {
+    hash = crypto.createHash('sha256').update(hash).digest('hex');
+  }
+
+  res.json({
+    hash: hash.substring(0, 16) + "...",
+    iterations: limit,
+    computation_time_ms: Date.now() - startTime
+  });
+});
+
+// ============================================
+// IO INTENSIVE ROUTES (100-300ms) - WITH AUTH
+// ============================================
+app.post("/api/io/read", authMiddleware, async (req, res) => {
+  try {
+    const startTime = Date.now();
+    const data = await fs.readFile(path.join(__dirname, 'package.json'), 'utf8');
+    const parsed = JSON.parse(data);
+
+    res.json({
+      name: parsed.name,
+      version: parsed.version,
+      dependencies: Object.keys(parsed.dependencies || {}).length,
+      io_time_ms: Date.now() - startTime,
+      user: req.body.username
+    });
+  } catch (error) {
+    res.status(500).json({ error: "File read failed" });
+  }
+});
+
+app.post("/api/io/write", authMiddleware, async (req, res) => {
+  const { content = "test data" } = req.body;
+  const tempFile = path.join(__dirname, `temp_${Date.now()}.txt`);
+
+  try {
+    const startTime = Date.now();
+    await fs.writeFile(tempFile, content.repeat(100));
+    const stats = await fs.stat(tempFile);
+    await fs.unlink(tempFile);
+
+    res.json({
+      bytes_written: stats.size,
+      io_time_ms: Date.now() - startTime,
+      user: req.body.username
+    });
+  } catch (error) {
+    res.status(500).json({ error: "File write failed" });
+  }
+});
+
+// ============================================
+// NETWORK INTENSIVE ROUTES (500-2000ms) - WITH AUTH
+// ============================================
+app.post("/api/network/external", authMiddleware, async (req, res) => {
+  try {
+    const startTime = Date.now();
+
+    // Simulate external API call
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    res.json({
+      ip: "203.0.113.42",
+      location: "Simulated Location",
+      network_time_ms: Date.now() - startTime,
+      user: req.body.username
+    });
+  } catch (error) {
+    res.status(500).json({ error: "External API failed" });
+  }
+});
+
+app.post("/api/network/dns-lookup", authMiddleware, async (req, res) => {
+  const startTime = Date.now();
+
+  try {
+    const dns = require('dns').promises;
+    const domains = ['google.com', 'github.com', 'stackoverflow.com'];
+
+    const results = await Promise.all(
+      domains.map(async domain => {
+        try {
+          const addresses = await dns.resolve4(domain);
+          return { domain, address: addresses[0], status: 'resolved' };
+        } catch (err) {
+          return { domain, status: 'failed' };
+        }
+      })
+    );
+
+    res.json({
+      lookups: results,
+      network_time_ms: Date.now() - startTime,
+      user: req.body.username
+    });
+  } catch (error) {
+    res.status(500).json({ error: "DNS lookup failed" });
+  }
+});
+
+// ============================================
+// HEAVY DATABASE ROUTES (300-1000ms) - WITH AUTH
+// ============================================
+app.post("/api/db/aggregate", authMiddleware, async (req, res) => {
+  try {
+    const startTime = Date.now();
+
+    const stats = await User.aggregate([
+      {
+        $group: {
+          _id: null,
+          totalUsers: { $sum: 1 },
+          uniqueUsernames: { $addToSet: "$username" }
+        }
+      }
+    ]);
+
+    res.json({
+      total_users: stats[0]?.totalUsers || 0,
+      unique_count: stats[0]?.uniqueUsernames.length || 0,
+      db_time_ms: Date.now() - startTime,
+      user: req.body.username
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Aggregation failed" });
+  }
+});
+
+app.post("/api/db/complex-query", authMiddleware, async (req, res) => {
+  try {
+    const startTime = Date.now();
+
+    // Simulated complex query with multiple operations
+    const users = await User.find({}).limit(100).exec();
+
+    // Simulate some processing
+    const processed = users.map(u => ({
+      id: u._id,
+      username: u.username,
+      hash: crypto.createHash('md5').update(u.username).digest('hex')
+    }));
+
+    res.json({
+      result_count: processed.length,
+      db_time_ms: Date.now() - startTime,
+      user: req.body.username
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Query failed" });
+  }
+});
+
+// ============================================
+// USER ROUTES
+// ============================================
+app.post("/login", async (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ error: "Username and password required" });
+  }
+
+  try {
+    const cachedUser = userCache.get(`user:${username}`);
+
+    if (cachedUser && cachedUser.password === password) {
+      return res.json({
+        success: true,
+        message: "Login successful",
+        username,
+        source: "cache"
+      });
+    }
+
+    const user = await User.findOne({ username, password }).limit(1);
+
+    if (!user) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    userCache.set(`user:${username}`, user);
+
+    res.json({
+      success: true,
+      message: "Login successful",
+      username,
+      source: "database"
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Login failed", details: error.message });
+  }
+});
+
+app.get("/users/list", async (req, res) => {
+  try {
+    const users = await User.find({}, { password: 0 })
+      .limit(MAX_QUERY_RESULTS)
+      .exec();
+
+    res.json({
+      users,
+      count: users.length,
+      limit: MAX_QUERY_RESULTS,
+      message: `Showing maximum ${MAX_QUERY_RESULTS} users`
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch users" });
+  }
+});
+
+app.get("/users/search", async (req, res) => {
+  const { q } = req.query;
+
+  if (!q) {
+    return res.status(400).json({ error: "Search query 'q' is required" });
+  }
+
+  try {
+    const users = await User.find(
+      { username: { $regex: q, $options: 'i' } },
+      { password: 0 }
+    )
+      .limit(MAX_QUERY_RESULTS)
+      .exec();
+
+    res.json({
+      users,
+      count: users.length,
+      limit: MAX_QUERY_RESULTS,
+      searchQuery: q
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Search failed" });
+  }
+});
+
+// Protected routes
+app.post("/user/profile", authMiddleware, (req, res) => {
+  res.json({
+    message: `Welcome, ${req.body.username}!`,
+    role: "standard-user"
+  });
+});
+
+app.post("/user/settings", authMiddleware, (req, res) => {
+  res.json({
+    message: `Settings fetched for ${req.body.username}`,
+    preferences: { theme: "dark", notifications: true },
+  });
+});
+
+// ============================================
+// CACHE STATISTICS ENDPOINT
+// ============================================
+app.get("/cache/stats", (req, res) => {
+  res.json(userCache.getStats());
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: "Route not found",
+    path: req.path,
+    availableRoutes: [
+      "/", "/health", "/current-metrics",
+      "/api/status", "/api/timestamp",
+      "/api/compute/prime/:n", "/api/compute/hash",
+      "/api/io/read (AUTH)", "/api/io/write (AUTH)",
+      "/api/network/external (AUTH)", "/api/network/dns-lookup (AUTH)",
+      "/api/db/aggregate (AUTH)", "/api/db/complex-query (AUTH)",
+      "/login", "/users/list", "/users/search",
+      "/user/profile (AUTH)", "/user/settings (AUTH)",
+      "/cache/stats"
+    ]
+  });
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error("Error:", err.message);
+  res.status(500).json({ error: "Internal server error", message: err.message });
+});
+
+// Start server
+app.listen(port, "0.0.0.0", () => {
+  console.log(`✓ Server running at http://0.0.0.0:${port}`);
+});
